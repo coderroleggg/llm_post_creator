@@ -1,0 +1,31 @@
+## IDEs
+.idea
+.vscode
+
+## Byte-compiled / optimized
+__pycache__/
+*.py[cod]
+
+## Temp dirs & trash
+*.log
+/temp
+/tmp
+/build
+/.build
+/out
+/gen
+*.iml
+.installed.cfg
+coverage*
+.coverage
+.cache
+/.pytest_cache
+
+## Local config
+.env
+
+# venv
+.venv
+venv
+
+.qodo

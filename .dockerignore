@@ -1,0 +1,6 @@
+.venv
+.env.example
+uv.lock
+.git
+scripts
+.vscode
