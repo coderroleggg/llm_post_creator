@@ -5,35 +5,34 @@ Telegram bot for processing audio files and voice messages.
 import asyncio
 import logging
 from pathlib import Path
+import json
+from typing import Dict, List, Optional
 
 from dotenv import load_dotenv
 from elevenlabs.client import ElevenLabs
 from openai import OpenAI
 from pydantic_settings import BaseSettings
 from telegram import InputFile, Update
+from telegram.constants import ParseMode
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_fixed
 
 DEFAULT_PROMPT = """
-You are an expert in processing speech transcriptions. Analyze the following audio transcription and transform it into clear, well-structured information. Follow these principles:
+Ты - профессиональный SMM-специалист в телеграм канале
 
-1. Identify the main topic and key points
-2. Group related ideas into logical sections with headings
-3. Fix inaccuracies, repetitions, and conversational elements
-4. Highlight important facts, figures, and data
-5. Use bullet points for enumerations
-6. Employ concise, clear phrasing
-7. Preserve important quotes in quotation marks
-8. Organize information by priority or chronology
-9. Add a brief conclusion at the end
-10. Respond in the same language as the transcription
+Вот примеры постов в канале:
+{examples}
 
-Transcription:
+Вот сырой текст идеи с диктофона для следующего поста:
 {text}
+
+Преврати сырой текст в качественный телеграм пост в моем стиле, опираясь на примеры постов в канале. 
+В ответе напиши только сам пост. Если нужно форматировать текст, используй markdown.
 """
 
 MAX_FILE_SIZE_MB = 100  # Maximum allowed file size in megabytes
 MAX_TELEGRAM_TEXT_LENGTH = 4096  # Telegram's maximum message length
+MAX_EXAMPLE_POSTS = 10  # Maximum number of example posts to include in the prompt
 
 
 class Settings(BaseSettings):
@@ -46,9 +45,45 @@ class Settings(BaseSettings):
     DEFAULT_PROMPT: str = DEFAULT_PROMPT
     LLM_BASE_URL: str = ""
     TEMP_DIR: Path = Path("temp")
+    USER_DATA_FILE: Path = Path("user_data.json")
+    EXAMPLE_POSTS_COUNT: int = MAX_EXAMPLE_POSTS
 
     class Config:
         env_file = ".env"
+
+
+class UserChannelData:
+    """Store user channel data."""
+
+    def __init__(self, data_file: Path):
+        self.data_file = data_file
+        self.user_channels: Dict[str, str] = {}
+        self.load_data()
+
+    def load_data(self):
+        """Load user channel data from file."""
+        if self.data_file.exists():
+            try:
+                with open(self.data_file, "r") as f:
+                    self.user_channels = json.load(f)
+            except json.JSONDecodeError:
+                self.user_channels = {}
+        else:
+            self.user_channels = {}
+
+    def save_data(self):
+        """Save user channel data to file."""
+        with open(self.data_file, "w") as f:
+            json.dump(self.user_channels, f)
+
+    def set_channel(self, user_id: str, channel_id: str):
+        """Set channel for user."""
+        self.user_channels[user_id] = channel_id
+        self.save_data()
+
+    def get_channel(self, user_id: str) -> Optional[str]:
+        """Get channel for user."""
+        return self.user_channels.get(user_id)
 
 
 class VoiceAssistantBot:
@@ -60,6 +95,9 @@ class VoiceAssistantBot:
         self.settings = Settings()
         self.setup_logging()
         self.create_temp_directory()
+        
+        # Initialize user channel data
+        self.user_channel_data = UserChannelData(self.settings.USER_DATA_FILE)
 
         # Create API clients
         self.elevenlabs_client = ElevenLabs(api_key=self.settings.ELEVENLABS_API_KEY)
@@ -89,8 +127,7 @@ class VoiceAssistantBot:
         # Add handlers
         application.add_handler(CommandHandler("start", self.start))
         application.add_handler(CommandHandler("help", self.help_command))
-        application.add_handler(CommandHandler("model", self.model_command))
-        application.add_handler(CommandHandler("prompt", self.prompt_command))
+        application.add_handler(CommandHandler("channel", self.channel_command))
         application.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, self.handle_audio))
 
         # Start the Bot
@@ -102,9 +139,14 @@ class VoiceAssistantBot:
         self.logger.info(f"Start command received from user {update.effective_user.id}")
 
         # Get current configuration
-        model = context.user_data.get("model", self.settings.LLM_MODEL)
-        prompt = context.user_data.get("prompt", self.settings.DEFAULT_PROMPT)
+        model = self.settings.LLM_MODEL
+        prompt = self.settings.DEFAULT_PROMPT
         base_url = self.settings.LLM_BASE_URL or "Default OpenAI"
+        
+        # Get user's channel if set
+        user_id = str(update.effective_user.id)
+        channel_id = self.user_channel_data.get_channel(user_id)
+        channel_info = f"- Channel for examples: {channel_id}" if channel_id else "- No channel set for examples"
 
         await update.message.reply_text(
             "Hi! I'm your voice assistant bot. Send me an audio file or voice message, "
@@ -112,38 +154,71 @@ class VoiceAssistantBot:
             "Available commands:\n"
             "/start - Start the bot\n"
             "/help - Show this help message\n"
-            "/model <model_name> - Change the LLM model (e.g., /model gpt-4-turbo)\n"
-            "/prompt <prompt_text> - Change the prompt template (e.g., /prompt Summarize this text:\n\n{text})\n\n"
+            "/channel @channel_username - Set the channel to get example posts from\n\n"
             f"Current settings:\n"
-            f"- LLM Model: {model}\n"
-            f"- LLM Base URL: {base_url}\n"
-            f"- Default Prompt: {prompt}"
+            f"{channel_info}\n"
         )
 
     async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Send a message when the command /help is issued."""
         self.logger.info(f"Help command received from user {update.effective_user.id}")
         await self.start(update, context)  # Reuse the start message
-
-    async def model_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Handle the /model command to change the LLM model."""
+    
+    async def channel_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle the /channel command to set a channel for example posts."""
         if not context.args:
-            await update.message.reply_text("Please specify a model. Example: /model gpt-4-turbo")
+            await update.message.reply_text("Please specify a channel. Example: /channel @my_channel")
             return
 
-        model = context.args[0]
-        context.user_data["model"] = model
-        await update.message.reply_text(f"Model changed to: {model}")
-
-    async def prompt_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Handle the /prompt command to change the prompt."""
-        if not context.args:
-            await update.message.reply_text("Please specify a prompt. Example: /prompt Summarize this text:\n\n{text}")
+        channel = context.args[0]
+        user_id = str(update.effective_user.id)
+        
+        # Validate that the channel format is correct
+        if not channel.startswith("@"):
+            await update.message.reply_text("Channel username must start with @. Example: /channel @my_channel")
             return
-
-        prompt = " ".join(context.args)
-        context.user_data["prompt"] = prompt
-        await update.message.reply_text(f"Prompt changed to: {prompt}")
+            
+        # Check if the bot has access to the channel (is an admin)
+        try:
+            # Try to get chat administrators to check if bot is admin
+            chat_administrators = await context.bot.get_chat_administrators(chat_id=channel)
+            bot_id = context.bot.id
+            
+            is_admin = any(admin.user.id == bot_id for admin in chat_administrators)
+            
+            if not is_admin:
+                await update.message.reply_text(
+                    f"I'm not an administrator in {channel}. Please add me as an administrator to access posts."
+                )
+                return
+                
+            # Store the channel for this user
+            self.user_channel_data.set_channel(user_id, channel)
+            await update.message.reply_text(f"Channel set to: {channel}")
+            
+        except Exception as e:
+            self.logger.error(f"Error checking channel access: {str(e)}")
+            await update.message.reply_text(
+                f"Could not access {channel}. Make sure the channel exists and I'm added as an administrator."
+            )
+        
+    async def get_example_posts(self, channel_id: str, bot) -> List[str]:
+        """Get example posts from a channel."""
+        self.logger.info(f"Fetching example posts from channel {channel_id}")
+        
+        try:
+            # Get the last N messages from the channel
+            messages = []
+            async for message in bot.get_chat_history(chat_id=channel_id, limit=self.settings.EXAMPLE_POSTS_COUNT):
+                # Only include messages with text content
+                if message.text:
+                    messages.append(message.text)
+                    
+            self.logger.info(f"Retrieved {len(messages)} example posts from channel {channel_id}")
+            return messages
+        except Exception as e:
+            self.logger.error(f"Error getting posts from channel {channel_id}: {str(e)}")
+            return []
 
     # Retry logic for ElevenLabs and OpenAI API calls
     @retry(
@@ -190,19 +265,38 @@ class VoiceAssistantBot:
         wait=wait_fixed(2),  # Wait 2 seconds between retries
         retry=retry_if_exception_type(Exception),  # Retry only on exceptions
     )
-    async def structure_text(self, text: str, context: ContextTypes.DEFAULT_TYPE) -> str:
+    async def structure_text(self, text: str, context: ContextTypes.DEFAULT_TYPE, user_id: str) -> str:
         """Structure the text using OpenAI."""
         self.logger.info("Starting text structuring with OpenAI")
 
         # Get model and prompt from user preferences or use defaults
-        model = context.user_data.get("model", self.settings.LLM_MODEL)
-        prompt = context.user_data.get("prompt", self.settings.DEFAULT_PROMPT)
+        model = self.settings.LLM_MODEL
+        prompt = self.settings.DEFAULT_PROMPT
+        
+        # Get example posts if user has a channel set
+        examples = ""
+        channel_id = self.user_channel_data.get_channel(user_id)
+        
+        if channel_id:
+            self.logger.info(f"Getting example posts from channel {channel_id} for user {user_id}")
+            example_posts = await self.get_example_posts(channel_id, context.bot)
+            if example_posts:
+                examples = "\n\n".join(example_posts)
+                self.logger.info(f"Added {len(example_posts)} example posts to prompt")
+            else:
+                self.logger.info("No example posts found or could not access channel")
+                examples = "No examples available"
+        else:
+            self.logger.info(f"User {user_id} has no channel set for examples")
+            examples = "No examples available"
 
-        # Run blocking API call in a separate thread
+        final_prompt = prompt.format(text=text, examples=examples)
+        self.logger.info(f"Final prompt: {final_prompt}")
+
         def _call_openai():
             return self.openai_client.chat.completions.create(
                 model=model,
-                messages=[{"role": "user", "content": prompt.format(text=text)}],
+                messages=[{"role": "user", "content": final_prompt}],
             )
 
         # Run the blocking operation in an executor
@@ -211,6 +305,15 @@ class VoiceAssistantBot:
         structured_text = response.choices[0].message.content
         self.logger.info("Successfully structured text with OpenAI")
         return structured_text
+
+    def escape_markdown(self, text: str) -> str:
+        markdown_special_chars = [
+            '\\', '`', '*', '_', '{', '}', '[', ']', '(', ')',
+            '#', '+', '-', '.', '!', '>'
+        ]
+        for char in markdown_special_chars:
+            text = text.replace(char, f'\\{char}')
+        return text
 
     async def send_text_or_file(self, update: Update, text: str, file_name: str, file_extension: str):
         """Send text or file depending on its length."""
@@ -224,22 +327,15 @@ class VoiceAssistantBot:
             )
             await update.message.reply_document(document=input_file)
         else:
-            # If text is short, send as a message and as a file
-            await update.message.reply_text(text)
-
-            # Also send as a document
-            filename = f"{file_name}.{file_extension}"
-            input_file = InputFile(
-                obj=text,  # Text will be automatically encoded to bytes
-                filename=filename,
-            )
-            await update.message.reply_document(document=input_file)
+            
+            await update.message.reply_text(self.escape_markdown(text), parse_mode=ParseMode.MARKDOWN_V2)
 
     async def handle_audio(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle incoming audio files and voice messages."""
         self.logger.info(f"Received audio message from user {update.effective_user.id}")
         local_path = None
         status_message = None
+        user_id = str(update.effective_user.id)
 
         try:
             # Determine the type of audio message
@@ -278,7 +374,7 @@ class VoiceAssistantBot:
             await status_message.edit_text("🧠 Structuring text using AI model...")
 
             # Structure the text
-            structured_text = await self.structure_text(transcription, context)
+            structured_text = await self.structure_text(transcription, context, user_id)
             await self.send_text_or_file(update, structured_text, f"structured_text_{file_id}", "md")
             self.logger.info("Sent structured text to user")
 

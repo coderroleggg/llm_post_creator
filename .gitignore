@@ -29,3 +29,4 @@ coverage*
 venv
 
 .qodo
+user_data.json
