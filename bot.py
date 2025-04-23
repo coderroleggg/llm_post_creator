@@ -53,37 +53,56 @@ class Settings(BaseSettings):
 
 
 class UserChannelData:
-    """Store user channel data."""
+    """Store user example posts data."""
 
     def __init__(self, data_file: Path):
         self.data_file = data_file
-        self.user_channels: Dict[str, str] = {}
+        self.user_examples: Dict[str, List[str]] = {}
         self.load_data()
 
     def load_data(self):
-        """Load user channel data from file."""
+        """Load user data from file."""
         if self.data_file.exists():
             try:
-                with open(self.data_file, "r") as f:
-                    self.user_channels = json.load(f)
+                with open(self.data_file, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    # Поддержка обратной совместимости - конвертация старого формата в новый
+                    for user_id, value in data.items():
+                        if isinstance(value, str):  # Старый формат - channel_id
+                            self.user_examples[user_id] = []
+                        else:  # Новый формат - список примеров
+                            self.user_examples[user_id] = value
             except json.JSONDecodeError:
-                self.user_channels = {}
+                self.user_examples = {}
         else:
-            self.user_channels = {}
+            self.user_examples = {}
 
     def save_data(self):
-        """Save user channel data to file."""
-        with open(self.data_file, "w") as f:
-            json.dump(self.user_channels, f)
+        """Save user data to file."""
+        with open(self.data_file, "w", encoding="utf-8") as f:
+            json.dump(self.user_examples, f, ensure_ascii=False, indent=4)
 
-    def set_channel(self, user_id: str, channel_id: str):
-        """Set channel for user."""
-        self.user_channels[user_id] = channel_id
+    def add_example_posts(self, user_id: str, posts: List[str]):
+        """Add example posts for user."""
+        if user_id not in self.user_examples:
+            self.user_examples[user_id] = []
+        
+        # Добавляем новые примеры и ограничиваем их количество
+        self.user_examples[user_id].extend(posts)
+        if len(self.user_examples[user_id]) > MAX_EXAMPLE_POSTS:
+            self.user_examples[user_id] = self.user_examples[user_id][-MAX_EXAMPLE_POSTS:]
+        
         self.save_data()
-
-    def get_channel(self, user_id: str) -> Optional[str]:
-        """Get channel for user."""
-        return self.user_channels.get(user_id)
+        return len(self.user_examples[user_id])
+    
+    def clear_example_posts(self, user_id: str):
+        """Clear all example posts for user."""
+        self.user_examples[user_id] = []
+        self.save_data()
+    
+    def get_example_posts(self, user_id: str) -> List[str]:
+        """Get example posts for user."""
+        return self.user_examples.get(user_id, [])
 
 
 class VoiceAssistantBot:
@@ -127,8 +146,9 @@ class VoiceAssistantBot:
         # Add handlers
         application.add_handler(CommandHandler("start", self.start))
         application.add_handler(CommandHandler("help", self.help_command))
-        application.add_handler(CommandHandler("channel", self.channel_command))
+        application.add_handler(CommandHandler("examples", self.examples_command))
         application.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, self.handle_audio))
+        application.add_handler(MessageHandler(filters.FORWARDED, self.handle_forwarded_message))
 
         # Start the Bot
         self.logger.info("Bot is starting...")
@@ -143,20 +163,21 @@ class VoiceAssistantBot:
         prompt = self.settings.DEFAULT_PROMPT
         base_url = self.settings.LLM_BASE_URL or "Default OpenAI"
         
-        # Get user's channel if set
+        # Get user's examples count
         user_id = str(update.effective_user.id)
-        channel_id = self.user_channel_data.get_channel(user_id)
-        channel_info = f"- Channel for examples: {channel_id}" if channel_id else "- No channel set for examples"
+        example_posts = self.user_channel_data.get_example_posts(user_id)
+        example_info = f"- Сохраненных примеров постов: {len(example_posts)}/{MAX_EXAMPLE_POSTS}" if example_posts else "- Нет сохраненных примеров постов"
 
         await update.message.reply_text(
-            "Hi! I'm your voice assistant bot. Send me an audio file or voice message, "
-            "and I'll transcribe it and structure it for you!\n\n"
-            "Available commands:\n"
-            "/start - Start the bot\n"
-            "/help - Show this help message\n"
-            "/channel @channel_username - Set the channel to get example posts from\n\n"
-            f"Current settings:\n"
-            f"{channel_info}\n"
+            "Привет! Я бот-ассистент по созданию постов. Отправьте мне аудиофайл или голосовое сообщение, "
+            "и я расшифрую его и структурирую для вас!\n\n"
+            "Доступные команды:\n"
+            "/start - Запустить бота\n"
+            "/help - Показать это сообщение\n"
+            "/examples - Управление примерами постов\n\n"
+            f"Текущие настройки:\n"
+            f"{example_info}\n\n"
+            f"Чтобы добавить примеры постов, просто перешлите сообщения из вашего канала."
         )
 
     async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -164,61 +185,86 @@ class VoiceAssistantBot:
         self.logger.info(f"Help command received from user {update.effective_user.id}")
         await self.start(update, context)  # Reuse the start message
     
-    async def channel_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Handle the /channel command to set a channel for example posts."""
-        if not context.args:
-            await update.message.reply_text("Please specify a channel. Example: /channel @my_channel")
-            return
-
-        channel = context.args[0]
+    async def examples_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle the /examples command to manage example posts."""
         user_id = str(update.effective_user.id)
         
-        # Validate that the channel format is correct
-        if not channel.startswith("@"):
-            await update.message.reply_text("Channel username must start with @. Example: /channel @my_channel")
-            return
-            
-        # Check if the bot has access to the channel (is an admin)
-        try:
-            # Try to get chat administrators to check if bot is admin
-            chat_administrators = await context.bot.get_chat_administrators(chat_id=channel)
-            bot_id = context.bot.id
-            
-            is_admin = any(admin.user.id == bot_id for admin in chat_administrators)
-            
-            if not is_admin:
-                await update.message.reply_text(
-                    f"I'm not an administrator in {channel}. Please add me as an administrator to access posts."
-                )
-                return
-                
-            # Store the channel for this user
-            self.user_channel_data.set_channel(user_id, channel)
-            await update.message.reply_text(f"Channel set to: {channel}")
-            
-        except Exception as e:
-            self.logger.error(f"Error checking channel access: {str(e)}")
+        # Проверяем, есть ли аргументы команды
+        if context.args and context.args[0].lower() == "clear":
+            # Очищаем примеры пользователя
+            self.user_channel_data.clear_example_posts(user_id)
             await update.message.reply_text(
-                f"Could not access {channel}. Make sure the channel exists and I'm added as an administrator."
+                "🗑️ Все примеры постов удалены!\n\n"
+                "Чтобы добавить новые примеры, просто перешлите сообщения из вашего канала."
             )
+            return
         
-    async def get_example_posts(self, channel_id: str, bot) -> List[str]:
-        """Get example posts from a channel."""
-        self.logger.info(f"Fetching example posts from channel {channel_id}")
+        # Получаем текущие примеры пользователя
+        examples = self.user_channel_data.get_example_posts(user_id)
+        example_count = len(examples)
         
-        try:
-            # Get the last N messages from the channel
-            messages = []
-            async for message in bot.get_chat_history(chat_id=channel_id, limit=self.settings.EXAMPLE_POSTS_COUNT):
-                # Only include messages with text content
-                if message.text:
-                    messages.append(message.text)
-                    
-            self.logger.info(f"Retrieved {len(messages)} example posts from channel {channel_id}")
-            return messages
-        except Exception as e:
-            self.logger.error(f"Error getting posts from channel {channel_id}: {str(e)}")
-            return []
+        # Формируем сообщение в зависимости от наличия примеров
+        if example_count > 0:
+            await update.message.reply_text(
+                f"📊 У вас сохранено {example_count} примеров постов.\n\n"
+                f"Чтобы добавить еще примеры, просто перешлите сообщения из вашего канала.\n"
+                f"Чтобы удалить все примеры, используйте команду /examples clear"
+            )
+        else:
+            await update.message.reply_text(
+                "📝 У вас еще нет сохраненных примеров постов.\n\n"
+                "Чтобы добавить примеры, просто перешлите сюда сообщения из вашего канала.\n"
+                "Эти примеры будут использоваться для определения стиля ваших постов."
+            )
+
+    async def handle_forwarded_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle forwarded messages as example posts."""
+        user_id = str(update.effective_user.id)
+        
+        # Определяем тип сообщения для логирования
+        message_type = "unknown"
+        if update.message.photo:
+            message_type = "photo"
+        elif update.message.video:
+            message_type = "video"
+        elif update.message.audio:
+            message_type = "audio"
+        elif update.message.voice:
+            message_type = "voice"
+        elif update.message.sticker:
+            message_type = "sticker"
+        elif update.message.document:
+            message_type = "document"
+        elif update.message.text and not update.message.photo and not update.message.video and not update.message.audio:
+            message_type = "text"
+        
+        self.logger.info(f"Received forwarded {message_type} message from user {update.effective_user.id}")
+        
+        # Извлекаем текст из сообщения, если он есть
+        post_text = update.message.text or update.message.caption or ""
+        
+        if post_text.strip():  # Проверяем, что текст не пустой после удаления пробелов
+            # Добавляем пример в хранилище
+            total_examples = self.user_channel_data.add_example_posts(user_id, [post_text])
+            
+            # Сообщаем пользователю о добавлении примера
+            if message_type == "text":
+                success_message = "✅ Пример поста сохранен!"
+            else:
+                success_message = f"✅ Текст из {message_type}-сообщения сохранен как пример!"
+                
+            await update.message.reply_text(
+                f"{success_message}\n"
+                f"Всего сохранено примеров: {total_examples}/{MAX_EXAMPLE_POSTS}\n\n"
+                f"Вы можете продолжать пересылать сообщения из канала, чтобы добавить больше примеров.\n"
+                f"Используйте команду /examples для управления примерами."
+            )
+        else:
+            # В сообщении нет текста или подписи
+            await update.message.reply_text(
+                "⚠️ В пересланном сообщении нет текста или подписи. "
+                "Пожалуйста, пересылайте сообщения, содержащие текст."
+            )
 
     # Retry logic for ElevenLabs and OpenAI API calls
     @retry(
@@ -273,21 +319,15 @@ class VoiceAssistantBot:
         model = self.settings.LLM_MODEL
         prompt = self.settings.DEFAULT_PROMPT
         
-        # Get example posts if user has a channel set
+        # Get example posts for the user
         examples = ""
-        channel_id = self.user_channel_data.get_channel(user_id)
+        example_posts = self.user_channel_data.get_example_posts(user_id)
         
-        if channel_id:
-            self.logger.info(f"Getting example posts from channel {channel_id} for user {user_id}")
-            example_posts = await self.get_example_posts(channel_id, context.bot)
-            if example_posts:
-                examples = "\n\n".join(example_posts)
-                self.logger.info(f"Added {len(example_posts)} example posts to prompt")
-            else:
-                self.logger.info("No example posts found or could not access channel")
-                examples = "No examples available"
+        if example_posts:
+            examples = "\n\n".join(example_posts)
+            self.logger.info(f"Added {len(example_posts)} example posts to prompt for user {user_id}")
         else:
-            self.logger.info(f"User {user_id} has no channel set for examples")
+            self.logger.info(f"User {user_id} has no example posts")
             examples = "No examples available"
 
         final_prompt = prompt.format(text=text, examples=examples)
