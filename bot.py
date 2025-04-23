@@ -6,6 +6,7 @@ import asyncio
 import logging
 from pathlib import Path
 import json
+import uuid
 from typing import Dict, List, Optional
 
 from dotenv import load_dotenv
@@ -149,7 +150,7 @@ class VoiceAssistantBot:
         application.add_handler(CommandHandler("examples", self.examples_command))
         application.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, self.handle_audio))
         application.add_handler(MessageHandler(filters.FORWARDED, self.handle_forwarded_message))
-
+        application.add_handler(MessageHandler(filters.TEXT, self.handle_text))
         # Start the Bot
         self.logger.info("Bot is starting...")
         application.run_polling()
@@ -341,7 +342,7 @@ class VoiceAssistantBot:
 
         # Run the blocking operation in an executor
         response = await asyncio.get_event_loop().run_in_executor(None, _call_openai)
-
+        self.logger.info(response)
         structured_text = response.choices[0].message.content
         self.logger.info("Successfully structured text with OpenAI")
         return structured_text
@@ -424,6 +425,38 @@ class VoiceAssistantBot:
         except Exception as e:
             self.logger.error(f"Error processing audio: {str(e)}", exc_info=True)
             error_message = "Sorry, I couldn't process that audio."
+
+            # Update status message if it exists
+            if status_message:
+                await status_message.edit_text(f"❌ {error_message}")
+            else:
+                await update.message.reply_text(error_message)
+        finally:
+            # Clean up temporary files (non-blocking)
+            asyncio.create_task(self.cleanup_temp_file(local_path))
+
+    async def handle_text(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle incoming text messages."""
+        self.logger.info(f"Received text message from user {update.effective_user.id}")
+        local_path = None
+        status_message = None
+        user_id = str(update.effective_user.id)
+        status_message = await update.message.reply_text("📥 Processing your text...")
+
+        try:
+            # Update status message
+            await status_message.edit_text("🧠 Structuring text using AI model...")
+            # Structure the text
+            structured_text = await self.structure_text(update.message.text, context, user_id)
+            await self.send_text_or_file(update, structured_text, f"structured_text_{str(uuid.uuid4())}", "md")
+            self.logger.info("Sent structured text to user")
+
+            # Final status update
+            await status_message.edit_text("✅ Processing complete!")
+
+        except Exception as e:
+            self.logger.error(f"Error processing text: {str(e)}", exc_info=True)
+            error_message = "Sorry, I couldn't process that text."
 
             # Update status message if it exists
             if status_message:
